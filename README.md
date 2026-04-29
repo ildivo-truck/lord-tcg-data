@@ -1,0 +1,1 @@
+# lord-tcg-data
