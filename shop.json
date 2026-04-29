@@ -1,0 +1,16 @@
+{
+  "updated": "2026-04-26",
+  "cards": [
+    {
+      "id":        "carta-001",
+      "name":      "Charizard ex",
+      "set":       "Prismatic Evolutions",
+      "number":    "199",
+      "condition": "NM",
+      "priceARS":  85000,
+      "priceUSD":  75,
+      "image":     "URL de la imagen",
+      "sold":      false
+    }
+  ]
+}
