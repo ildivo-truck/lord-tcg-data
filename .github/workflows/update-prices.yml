@@ -1,0 +1,35 @@
+name: Update PSA10 Prices
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"  # Todos los lunes a las 8am UTC
+  workflow_dispatch:       # Lanzar manual desde GitHub Actions
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Fetchear precios PSA10
+        run: python scripts/fetch_psa10.py
+
+      - name: Commit si hubo cambios
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add prices.json
+          git diff --staged --quiet || git commit -m "chore: precios PSA10 $(date +%Y-%m-%d)"
+          git push
