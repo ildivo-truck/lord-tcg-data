@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
+import asyncio
 import json
 import re
 import sys
-import time
 import unicodedata
 import urllib.request
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright
 except ImportError:
     print("Instalar: pip install playwright && python -m playwright install chromium")
     sys.exit(1)
 
-try:
-    from playwright_stealth import stealth_sync
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-
 ROOT = Path(__file__).parent.parent
 POKEMON_API = "https://api.pokemontcg.io/v2"
 DEBUG = "--debug" in sys.argv
+CONCURRENCY = 5   # páginas del browser corriendo en paralelo
+STALE_DAYS = 6    # re-scrapear cartas no actualizadas en los últimos 6 días
 
 
 def parse_price(text):
@@ -53,18 +49,18 @@ def get_set_cards(set_id):
     return data.get("data", [])
 
 
-def scrape_psa10(page, url):
+async def scrape_psa10(page, url):
     psa10_index = None
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(3000)
-
-        for row in page.query_selector_all("tr"):
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(2000)
+        rows = await page.query_selector_all("tr")
+        for row in rows:
             try:
-                cells = row.query_selector_all("td")
+                cells = await row.query_selector_all("td")
                 if not cells:
                     continue
-                row_text = row.inner_text().strip()
+                row_text = (await row.inner_text()).strip()
                 if not row_text:
                     continue
                 cols = [c.strip() for c in row_text.split("\t")]
@@ -87,27 +83,87 @@ def scrape_psa10(page, url):
     return None
 
 
-def main():
+async def process_card(sem, context, card_id, url, prices, today_str):
+    async with sem:
+        page = await context.new_page()
+        try:
+            psa10 = await scrape_psa10(page, url)
+            if psa10 is not None:
+                prices.setdefault(card_id, {})["psa10"] = psa10
+                prices[card_id]["last_updated"] = today_str
+                print(f"   OK {card_id}: ${psa10:,.2f}")
+                return True
+            else:
+                if DEBUG:
+                    print(f"   SKIP {card_id}")
+                return False
+        finally:
+            await page.close()
+            await asyncio.sleep(0.5)
+
+
+async def amain():
     track_file = ROOT / "to_track.json"
     slugs_file = ROOT / "set_slugs.json"
     prices_file = ROOT / "prices.json"
 
     with open(track_file) as f:
         to_track = json.load(f)
-
     with open(slugs_file) as f:
         set_slugs = json.load(f)
-
     with open(prices_file) as f:
         data = json.load(f)
 
     prices = data.get("prices", {})
-    updated = 0
-    manual_failed = []
+    today = date.today()
+    today_str = str(today)
+    cutoff = today - timedelta(days=STALE_DAYS)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
+    def is_fresh(card_id):
+        lu = prices.get(card_id, {}).get("last_updated")
+        if not lu:
+            return False
+        try:
+            return datetime.fromisoformat(lu).date() >= cutoff
+        except ValueError:
+            return False
+
+    tasks = []
+    manual_ids = set()
+    skipped = 0
+
+    # Entradas manuales de to_track.json
+    for card_id, url in to_track.items():
+        manual_ids.add(card_id)
+        if is_fresh(card_id):
+            skipped += 1
+        else:
+            tasks.append((card_id, url))
+
+    # Sets completos de set_slugs.json
+    for set_id, pc_slug in set_slugs.items():
+        try:
+            cards = get_set_cards(set_id)
+        except Exception as e:
+            print(f"Error en set {set_id}: {e}")
+            continue
+        for card in cards:
+            card_id = card["id"]
+            if is_fresh(card_id):
+                skipped += 1
+                continue
+            name_slug = slugify(card.get("name", ""))
+            number = card.get("number", "")
+            url = f"https://www.pricecharting.com/game/{pc_slug}/{name_slug}-{number}"
+            tasks.append((card_id, url))
+
+    print(f"Total: {len(tasks)} cartas a scrapear | {skipped} salteadas (actualizadas recientemente)")
+
+    sem = asyncio.Semaphore(CONCURRENCY)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -115,66 +171,30 @@ def main():
             ),
             viewport={"width": 1280, "height": 800},
         )
-        page = ctx.new_page()
-        if HAS_STEALTH:
-            stealth_sync(page)
 
-        # Entradas manuales de to_track.json
-        if to_track:
-            print("=== Manual (to_track.json) ===")
-        for card_id, url in to_track.items():
-            slug = url.split("/")[-1]
-            print(f"-> {card_id} ({slug})")
-            psa10 = scrape_psa10(page, url)
-            if psa10 is not None:
-                prices.setdefault(card_id, {})["psa10"] = psa10
-                print(f"   OK PSA 10: ${psa10:,.2f}")
-                updated += 1
-            else:
-                manual_failed.append(card_id)
-                print(f"   FAIL: no encontrado")
-            time.sleep(2)
+        results = await asyncio.gather(
+            *[process_card(sem, ctx, cid, url, prices, today_str) for cid, url in tasks]
+        )
+        await browser.close()
 
-        # Sets completos de set_slugs.json
-        for set_id, pc_slug in set_slugs.items():
-            print(f"\n=== Set {set_id} -> {pc_slug} ===")
-            try:
-                cards = get_set_cards(set_id)
-            except Exception as e:
-                print(f"  Error al obtener cartas: {e}")
-                continue
+    updated = sum(1 for r in results if r)
 
-            for card in cards:
-                card_id = card["id"]
-                name = card.get("name", "")
-                number = card.get("number", "")
-                name_slug = slugify(name)
-                url = f"https://www.pricecharting.com/game/{pc_slug}/{name_slug}-{number}"
-                print(f"-> {card_id} ({name_slug}-{number})")
-                if DEBUG:
-                    print(f"   URL: {url}")
-                psa10 = scrape_psa10(page, url)
-                if psa10 is not None:
-                    prices.setdefault(card_id, {})["psa10"] = psa10
-                    print(f"   OK PSA 10: ${psa10:,.2f}")
-                    updated += 1
-                else:
-                    print(f"   SKIP")
-                time.sleep(2)
-
-        browser.close()
+    # Verificar manuales fallidas
+    manual_failed = [
+        cid for cid, _ in tasks
+        if cid in manual_ids and not prices.get(cid, {}).get("psa10")
+    ]
 
     data["prices"] = prices
-    data["updated"] = str(date.today())
-
+    data["updated"] = today_str
     with open(prices_file, "w") as f:
         json.dump(data, f, indent=2)
 
-    print(f"\nActualizadas: {updated}")
+    print(f"\nActualizadas: {updated} | Sin precio: {len(tasks) - updated} | Salteadas: {skipped}")
     if manual_failed:
         print("Manuales fallidas:", ", ".join(manual_failed))
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(amain())
